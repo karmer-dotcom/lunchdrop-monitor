@@ -2,12 +2,13 @@ name: Lunchdrop Monitor
 
 on:
   schedule:
-    - cron: "30 14 * * 1-5"   # weekdays 14:30 UTC
+    - cron: "30 14 * * 1-5"   # weekdays at 14:30 UTC
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -15,6 +16,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"            # ✅ Cache pip dependencies
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
 
       - name: Install dependencies & browsers
         run: |
@@ -33,7 +43,6 @@ jobs:
           HEADLESS: "true"
           VERBOSE: "true"
           SEND_EMPTY_SLACK: "true"
-          # Optional (only if you created these secrets):
           CSS_CARD_SELECTORS: ${{ secrets.CSS_CARD_SELECTORS }}
           MIN_CARD_COUNT: ${{ secrets.MIN_CARD_COUNT }}
         run: python monitor_lunchdrop.py
