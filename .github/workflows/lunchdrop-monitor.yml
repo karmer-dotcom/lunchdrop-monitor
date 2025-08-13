@@ -1,0 +1,51 @@
+name: Lunchdrop Monitor
+
+on:
+  schedule:
+    # 14:30 UTC = 10:30 AM America/New_York (edit to your preference)
+    - cron: "30 14 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install-deps
+          # Try Chrome first (runner has it), then fallback: install chromium if needed
+          (python - <<'PY'
+from playwright.sync_api import sync_playwright
+try:
+    with sync_playwright() as p:
+        p.chromium.launch(channel="chrome").close()
+    print("Chrome channel OK")
+except Exception:
+    print("Installing chromium fallback…")
+    import subprocess, sys
+    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+PY
+          )
+
+      - name: Run monitor
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          LOOKAHEAD_DAYS: ${{ secrets.LOOKAHEAD_DAYS }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          LUNCHDROP_EMAIL: ${{ secrets.LUNCHDROP_EMAIL }}
+          LUNCHDROP_PASSWORD: ${{ secrets.LUNCHDROP_PASSWORD }}
+          HEADLESS: "true"
+          VERBOSE: "true"
+          # Optional tuning:
+          # CSS_CARD_SELECTORS: ${{ secrets.CSS_CARD_SELECTORS }}
+          # MIN_CARD_COUNT: ${{ secrets.MIN_CARD_COUNT }}
+        run: |
+          python monitor_lunchdrop.py
