@@ -1,36 +1,13 @@
 #!/usr/bin/env python3
 """
-Lunchdrop Future Menus Monitor (password login + Slack)
-- Checks a rolling window of FUTURE dates at: https://<city>.lunchdrop.com/app/YYYY-MM-DD
-- Alerts Slack when a date that used to be empty now has menus.
-- Sends an optional "heartbeat" Slack message when there are NO new menus (so you know the job ran).
-
-Required env/secrets:
-  BASE_URL=https://austin.lunchdrop.com/app
-  LOOKAHEAD_DAYS=14
-  SLACK_WEBHOOK_URL=...
-  LUNCHDROP_EMAIL=...
-  LUNCHDROP_PASSWORD=...
-
-Optional:
-  HEADLESS=true
-  VERBOSE=true
-  SEND_EMPTY_SLACK=true
-  CSS_CARD_SELECTORS=.card:has-text("Show Menu"), .restaurant-card
-  MIN_CARD_COUNT=1
-  TIMEOUT_MS=25000
-  STATE_DIR=.ld_state
+Lunchdrop Future Menus Monitor (Always Slack Version)
+- Checks future Lunchdrop dates and sends Slack whether or not menus changed.
 """
+
 import os, hashlib, json, time
 from pathlib import Path
 from typing import List, Optional, Tuple
 from datetime import date, timedelta
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -49,17 +26,15 @@ STATE_DIR = Path(os.getenv("STATE_DIR", ".ld_state"))
 TIMEOUT_MS = int(os.getenv("TIMEOUT_MS", "25000"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 VERBOSE = os.getenv("VERBOSE", "false").lower() == "true"
-SEND_EMPTY_SLACK = os.getenv("SEND_EMPTY_SLACK", "true").lower() == "true"
 
-if not BASE_URL:
-    raise SystemExit("Please set BASE_URL (e.g. https://austin.lunchdrop.com/app)")
-if not SLACK_WEBHOOK_URL:
-    raise SystemExit("Please set SLACK_WEBHOOK_URL")
-if not (LUNCHDROP_EMAIL and LUNCHDROP_PASSWORD):
-    raise SystemExit("Please set LUNCHDROP_EMAIL and LUNCHDROP_PASSWORD")
+if not BASE_URL or not SLACK_WEBHOOK_URL or not LUNCHDROP_EMAIL or not LUNCHDROP_PASSWORD:
+    raise SystemExit("Missing required env vars: BASE_URL, SLACK_WEBHOOK_URL, LUNCHDROP_EMAIL, LUNCHDROP_PASSWORD")
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+# --------------------
+# Helpers
+# --------------------
 def log(msg: str):
     if VERBOSE:
         print(msg)
@@ -104,57 +79,50 @@ PASSWORD_SELECTORS = ["input[type=password]", "input[name=password]"]
 SUBMIT_SELECTORS = ["button:has-text('Sign in')", "button:has-text('Sign In')", "button[type=submit]"]
 
 def ensure_logged_in(page):
-    """Fill email/password and submit if a login form is present."""
     try:
         if any(page.locator(sel).count() > 0 for sel in PASSWORD_SELECTORS + SIGNIN_SELECTORS):
-            print("🔐 Detected login form — attempting sign-in…")
-            # Email/username
+            print("🔐 Logging in…")
             for sel in SIGNIN_SELECTORS:
                 if page.locator(sel).count() > 0:
-                    page.fill(sel, LUNCHDROP_EMAIL); break
-            # Password
+                    page.fill(sel, LUNCHDROP_EMAIL)
+                    break
             for sel in PASSWORD_SELECTORS:
                 if page.locator(sel).count() > 0:
-                    page.fill(sel, LUNCHDROP_PASSWORD); break
-            # Submit
+                    page.fill(sel, LUNCHDROP_PASSWORD)
+                    break
             for sel in SUBMIT_SELECTORS:
                 if page.locator(sel).count() > 0:
-                    page.click(sel); break
+                    page.click(sel)
+                    break
             page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-            print("✅ Login flow finished (no errors thrown).")
-        else:
-            log("No login form detected; proceeding.")
+            print("✅ Logged in.")
     except PlaywrightTimeoutError:
-        print("⚠️ Timed out during login; continuing anyway.")
+        print("⚠️ Login timeout.")
 
 def extract_snapshot_and_availability(page) -> Tuple[dict, bool, int]:
-    """
-    Returns: (snapshot_dict, available, card_count)
-    """
-    # Preferred: user-provided selectors
     if CSS_CARD_SELECTORS:
-        texts: List[str] = []; total = 0
+        texts: List[str] = []
+        total = 0
         for sel in CSS_CARD_SELECTORS:
             try:
-                els = page.locator(sel).all(); total += len(els)
+                els = page.locator(sel).all()
+                total += len(els)
                 for el in els:
                     t = el.inner_text(timeout=2000)
-                    if t: texts.append(stable_text(t))
+                    if t:
+                        texts.append(stable_text(t))
             except Exception:
                 continue
         key = "\n".join(sorted(set(texts)))
         digest = content_hash(key)
-        print(f"🧭 Selector scan: {total} card(s) detected; digest={digest[:10]}…")
         return ({"mode": "selectors", "digest": digest}, total >= MIN_CARD_COUNT, total)
 
-    # Fallback: count “Show Menu”/“View Menu” hits
     hits = 0
     try: hits += page.locator("text=Show Menu").count()
     except Exception: pass
     try: hits += page.locator("text=View Menu").count()
     except Exception: pass
 
-    # Snapshot for digest
     main_text = None
     try:
         if page.locator("main").count() > 0:
@@ -162,10 +130,12 @@ def extract_snapshot_and_availability(page) -> Tuple[dict, bool, int]:
     except Exception:
         pass
     if not main_text:
-        try: main_text = page.locator("body").inner_text(timeout=4000)
-        except Exception: main_text = ""
-    key = stable_text(main_text); digest = content_hash(key)
-    print(f"🧭 Text scan: {hits} menu-hit(s); digest={digest[:10]}…")
+        try:
+            main_text = page.locator("body").inner_text(timeout=4000)
+        except Exception:
+            main_text = ""
+    key = stable_text(main_text)
+    digest = content_hash(key)
     return ({"mode": "snapshot", "digest": digest}, hits >= MIN_CARD_COUNT, hits)
 
 def check_date(browser, d: date) -> dict:
@@ -177,13 +147,10 @@ def check_date(browser, d: date) -> dict:
         page.goto(url, timeout=TIMEOUT_MS)
         page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
         ensure_logged_in(page)
-        time.sleep(1.2)  # allow client-side render
+        time.sleep(1.2)
         snap, avail, count = extract_snapshot_and_availability(page)
-        snap["available"] = avail; snap["count"] = count
-        if avail:
-            print(f"✅ {d.isoformat()}: menus available (count={count})")
-        else:
-            print(f"🕗 {d.isoformat()}: no menus yet")
+        snap["available"] = avail
+        snap["count"] = count
         return {"url": url, "snap": snap}
     except PlaywrightTimeoutError:
         return {"url": url, "error": f"Timeout loading {url}"}
@@ -197,13 +164,10 @@ def check_date(browser, d: date) -> dict:
 # --------------------
 def main():
     future_dates = [date.today() + timedelta(days=i) for i in range(1, LOOKAHEAD_DAYS + 1)]
-    start = future_dates[0]; end = future_dates[-1]
-    print(f"🚀 Lunchdrop monitor starting — scanning {LOOKAHEAD_DAYS} day(s): {start.isoformat()} → {end.isoformat()}")
-
-    newly_available = []; errors = []
+    newly_available = []
+    errors = []
 
     with sync_playwright() as p:
-        # Try Chrome channel (works on GitHub runners); fall back to bundled
         try:
             browser = p.chromium.launch(channel="chrome", headless=HEADLESS)
         except Exception:
@@ -213,10 +177,11 @@ def main():
             result = check_date(browser, d)
             url = result["url"]
             if "error" in result:
-                print(f"⚠️  {result['error']}")
-                errors.append(result["error"]); continue
+                errors.append(result["error"])
+                continue
 
-            snap = result["snap"]; prev = load_state(url)
+            snap = result["snap"]
+            prev = load_state(url)
             prev_available = prev.get("available") if prev else None
             prev_digest = prev.get("digest") if prev else None
             save_state(url, snap)
@@ -226,31 +191,22 @@ def main():
 
             if (prev_available in (None, False)) and now_avail:
                 newly_available.append((d, url, snap.get("count", 0)))
-                print(f"🎉 NEW: {d.isoformat()} just became available (count={snap.get('count', 0)})")
             elif changed and now_avail:
                 newly_available.append((d, url, snap.get("count", 0)))
-                print(f"🔁 UPDATED: {d.isoformat()} content changed (count={snap.get('count', 0)})")
 
         browser.close()
 
-    # Slack reporting
+    # Always send a Slack message
     if newly_available:
-        blocks = [{"type":"section","text":{"type":"mrkdwn","text":"*🎉 New future Lunchdrop dates available:*"}}]
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*🎉 New future Lunchdrop dates available:*"}}]
         for d, url, count in newly_available:
-            blocks.append({"type":"section","text":{"type":"mrkdwn","text":f"• *{d.isoformat()}* — <{url}|view> ({count} menus)"}})
-        blocks.append({"type":"context","elements":[{"type":"mrkdwn","text":f"Scanned {LOOKAHEAD_DAYS} day(s): {start.isoformat()} → {end.isoformat()}"}]})
-        blocks.append({"type":"divider"})
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"• *{d.isoformat()}* — <{url}|view> ({count} menus)"}})
         notify_slack("New future Lunchdrop dates available", blocks)
         print(f"📣 Notified Slack: {len(newly_available)} date(s)")
     else:
-        print("✅ No new future menus detected.")
-        if SEND_EMPTY_SLACK:
-            blocks = [
-                {"type":"section","text":{"type":"mrkdwn","text":"*✅ Lunchdrop monitor ran* — no new future menus to report."}},
-                {"type":"context","elements":[{"type":"mrkdwn","text":f"Scanned {LOOKAHEAD_DAYS} day(s): {start.isoformat()} → {end.isoformat()}"}]}
-            ]
-            notify_slack("Lunchdrop monitor heartbeat — no new menus", blocks)
-            print("📣 Sent heartbeat to Slack.")
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*✅ Lunchdrop monitor ran — no new future menus to report.*"}}]
+        notify_slack("Lunchdrop monitor heartbeat — no new menus", blocks)
+        print("📣 Sent heartbeat to Slack.")
 
     for e in errors:
         print(f"[warn] {e}")
