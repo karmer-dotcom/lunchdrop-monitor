@@ -1,50 +1,31 @@
-name: Lunchdrop Debug Probe
+name: Monitor Lunchdrop
 
 on:
-  workflow_dispatch: {}     # run manually while we debug
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '*/15 * * * *'  # runs every 15 minutes (optional, adjust as needed)
+  workflow_dispatch:  # allows manual triggering from GitHub UI
 
 jobs:
-  run:
+  monitor:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Set up Python (pip cache on)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: '3.10'  # or your project’s version
 
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-playwright-
-
-      - name: Install deps & browsers
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m playwright install-deps
-          python -m playwright install chromium
 
-      - name: Show script head
-        run: sed -n '1,40p' debug_probe.py
-
-      - name: Run debug probe
-        env:
-          BASE_URL: ${{ secrets.BASE_URL }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          LUNCHDROP_EMAIL: ${{ secrets.LUNCHDROP_EMAIL }}
-          LUNCHDROP_PASSWORD: ${{ secrets.LUNCHDROP_PASSWORD }}
-          HEADLESS: "true"
-          PROBE_OFFSET_DAYS: "0"   # 0=today, set to 1 for tomorrow, etc.
-        run: python debug_probe.py
-
-      - name: Upload artifacts (screenshot + html)
-        uses: actions/upload-artifact@v4
-        with:
-          name: lunchdrop-probe
-          path: probe_artifacts/*
+      - name: Run Lunchdrop Monitor
+        run: |
+          python monitor_lunchdrop.py
