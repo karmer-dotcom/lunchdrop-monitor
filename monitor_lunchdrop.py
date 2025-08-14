@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Lunchdrop Future Menus Monitor — v5
-- Availability: message-based (absent => menus available).
-- Names: heuristic extraction (buttons "Show/View Menu" -> nearest card -> heading).
+Lunchdrop Future Menus Monitor — v6
+- Availability: positive-first (buttons "Show/View Menu"), else message-based (absent => menus available).
+- Normalized text comparison for robustness (case/punctuation/whitespace).
+- Names: heuristic extraction (buttons -> nearest card -> heading / first line).
 - Always sends Slack (new menus OR heartbeat).
+- Saves artifacts (screenshot + HTML) when a page is judged "no menus".
 """
 
-import os, hashlib, json, time, re
+import os, hashlib, json, time, re, string
 from pathlib import Path
 from typing import Optional, Tuple
 from datetime import date, timedelta
 
 # Banner: show version + commit SHA if available
-SCRIPT_VERSION = "v5"
+SCRIPT_VERSION = "v6"
 GITHUB_SHA = os.getenv("GITHUB_SHA", "")[:7]
 print(f"🚀 Lunchdrop monitor {SCRIPT_VERSION}  commit={GITHUB_SHA or 'local'}")
 
@@ -35,13 +37,14 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 LUNCHDROP_EMAIL = os.getenv("LUNCHDROP_EMAIL")
 LUNCHDROP_PASSWORD = os.getenv("LUNCHDROP_PASSWORD")
 
-# Message shown when no menus exist yet (case-insensitive)
+# Shorter "no menus yet" phrase; normalized compare below
 NO_MENU_MESSAGE = os.getenv(
     "NO_MENU_MESSAGE",
-    "The restaurants for this day will be scheduled shortly."
-).strip()
+    "restaurants for this day will be scheduled shortly"
+).strip().lower()
 
 STATE_DIR = Path(os.getenv("STATE_DIR", ".ld_state"))
+ART_DIR = Path(os.getenv("ART_DIR", "artifacts"))  # where we drop screenshots/HTML on no-menu
 TIMEOUT_MS = int(os.getenv("TIMEOUT_MS", "25000"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 VERBOSE = os.getenv("VERBOSE", "true").lower() == "true"
@@ -54,6 +57,7 @@ if missing:
     raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
+ART_DIR.mkdir(parents=True, exist_ok=True)
 
 # --------------------
 # Helpers
@@ -71,6 +75,11 @@ def notify_slack(text: str, blocks: Optional[list] = None):
 
 def stable_text(s: str) -> str:
     return " ".join(s.split())
+
+def normalize(s: str) -> str:
+    """lowercase, strip punctuation, collapse whitespace"""
+    table = str.maketrans("", "", string.punctuation)
+    return " ".join(s.lower().translate(table).split())
 
 def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -122,12 +131,22 @@ def ensure_logged_in(page):
     except PlaywrightTimeoutError:
         print("⚠️ Login timeout; continuing anyway.")
 
+def positive_menu_hits(page) -> int:
+    """Count accessible 'Show/View Menu' buttons."""
+    hits = 0
+    try:
+        hits += page.get_by_role("button", name=re.compile(r"(show|view)\s*menu", re.I)).count()
+    except Exception:
+        pass
+    return hits
+
 def detect_availability_and_digest(page) -> Tuple[bool, str, str]:
     """
-    Heuristic: if NO_MENU_MESSAGE appears (case-insensitive) => no menus.
-               else => menus are available.
-    Returns: (available, digest_of_page_text, normalized_text)
+    Positive-first: if any 'Show/View Menu' buttons exist => available.
+    Else: message-based — if NO_MENU_MESSAGE present (normalized) => not available; else available.
+    Returns: (available, digest_of_normalized_text, raw_text_for_ref)
     """
+    # Grab text from main/body
     txt = ""
     try:
         if page.locator("main").count() > 0:
@@ -140,11 +159,21 @@ def detect_availability_and_digest(page) -> Tuple[bool, str, str]:
         except Exception:
             txt = ""
 
-    norm = stable_text(txt)
-    available = NO_MENU_MESSAGE.lower() not in norm.lower()
-    digest = content_hash(norm.lower())
-    print(f"🔎 Message check: available={available}  digest={digest[:10]}…")
-    return available, digest, norm
+    norm_full = stable_text(txt)
+    norm_cmp = normalize(norm_full)
+
+    hits = positive_menu_hits(page)
+    if hits > 0:
+        available = True
+        reason = f"positive buttons (hits={hits})"
+    else:
+        available = NO_MENU_MESSAGE in norm_cmp
+        available = not available  # invert: presence of no-menu => not available
+        reason = "message check"
+
+    digest = content_hash(norm_cmp)
+    print(f"🔎 Availability: {available}  via {reason}; digest={digest[:10]}…")
+    return available, digest, norm_full
 
 def extract_restaurant_names(page) -> list[str]:
     """
@@ -159,17 +188,14 @@ def extract_restaurant_names(page) -> list[str]:
         buttons = page.get_by_role("button", name=re.compile(r"(show|view)\s*menu", re.I)).all()
         for b in buttons:
             try:
-                # nearest plausible card container
                 container = b.locator(
                     "xpath=ancestor::*[self::article or self::section or contains(@class,'card') or contains(@class,'Card')][1]"
                 )
-                # prefer an explicit heading
                 head = container.get_by_role("heading").first
                 name = ""
                 if head.count() > 0:
                     name = head.inner_text(timeout=2000).strip()
                 else:
-                    # fallback: first non-empty line of container text that isn't the button
                     txt = container.inner_text(timeout=2000)
                     for line in (l.strip() for l in txt.splitlines()):
                         if line and not re.search(r"(show|view)\s*menu", line, re.I):
@@ -187,7 +213,7 @@ def extract_restaurant_names(page) -> list[str]:
             for h in page.get_by_role("heading").all():
                 try:
                     t = h.inner_text(timeout=1500).strip()
-                    if t and len(t) <= 60 and not re.search(r"\bmenu\b", t, re.I):
+                    if t and 2 <= len(t) <= 60 and not re.search(r"\bmenu\b", t, re.I):
                         names.add(stable_text(t))
                 except Exception:
                     continue
@@ -202,17 +228,17 @@ def check_date(browser, d: date) -> dict:
     page = ctx.new_page()
     try:
         print(f"📅 Checking {d.isoformat()} → {url}")
-        # First load (may hit sign-in)
         page.goto(url, timeout=TIMEOUT_MS)
         page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
         ensure_logged_in(page)
 
-        # Revisit the date URL post-auth
+        # Revisit the date URL post-auth and allow extra settle time
         page.goto(url, timeout=TIMEOUT_MS)
         page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-        time.sleep(1.5)  # let client JS render
+        page.wait_for_timeout(2000)  # extra settle for client rendering
 
         available, digest, _norm = detect_availability_and_digest(page)
+
         names = []
         if available:
             try:
@@ -220,6 +246,16 @@ def check_date(browser, d: date) -> dict:
                 print(f"🍽️  Found {len(names)} restaurant name(s): {', '.join(names[:6])}{'…' if len(names)>6 else ''}")
             except Exception as e:
                 print(f"⚠️ name extraction failed: {e}")
+        else:
+            # Save artifacts to debug false negatives
+            png_path = ART_DIR / f"{d.isoformat()}-screen.png"
+            html_path = ART_DIR / f"{d.isoformat()}-page.html"
+            try:
+                page.screenshot(path=str(png_path), full_page=True)
+                html_path.write_text(page.content(), encoding="utf-8")
+                print(f"🗂️  Saved artifacts: {png_path.name}, {html_path.name}")
+            except Exception as e:
+                print(f"⚠️ artifact save failed: {e}")
 
         return {"url": url, "available": available, "digest": digest, "names": names}
     except PlaywrightTimeoutError:
@@ -235,7 +271,7 @@ def check_date(browser, d: date) -> dict:
 def main():
     future_dates = [date.today() + timedelta(days=i) for i in range(1, LOOKAHEAD_DAYS + 1)]
     print(f"📆 Window: {future_dates[0].isoformat()} → {future_dates[-1].isoformat()}  (days={LOOKAHEAD_DAYS})")
-    print(f"ℹ️ Using no-menu message: “{NO_MENU_MESSAGE}”")
+    print(f"ℹ️ Using no-menu message (normalized contains): “{NO_MENU_MESSAGE}”")
 
     newly_available = []
     errors = []
