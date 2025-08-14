@@ -1,31 +1,52 @@
-name: Monitor Lunchdrop
+name: Lunchdrop Monitor
 
 on:
-  push:
-    branches:
-      - main
   schedule:
-    - cron: '*/15 * * * *'  # runs every 15 minutes (optional, adjust as needed)
-  workflow_dispatch:  # allows manual triggering from GitHub UI
+    - cron: "30 14 * * 1-5"   # weekdays at 14:30 UTC (adjust as needed)
+  workflow_dispatch: {}
 
 jobs:
-  monitor:
+  run:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python (with pip cache)
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'  # or your project’s version
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install dependencies
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install dependencies & browsers
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m playwright install-deps
+          python -m playwright install chromium
 
-      - name: Run Lunchdrop Monitor
+      - name: Show commit and script head
         run: |
-          python monitor_lunchdrop.py
+          echo "Commit from runner: $GITHUB_SHA"
+          echo "----- First 20 lines of monitor_lunchdrop.py -----"
+          sed -n '1,20p' monitor_lunchdrop.py
+
+      - name: Run monitor
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          LOOKAHEAD_DAYS: ${{ secrets.LOOKAHEAD_DAYS }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          LUNCHDROP_EMAIL: ${{ secrets.LUNCHDROP_EMAIL }}
+          LUNCHDROP_PASSWORD: ${{ secrets.LUNCHDROP_PASSWORD }}
+          HEADLESS: "true"
+          VERBOSE: "true"
+          NO_MENU_MESSAGE: ${{ vars.NO_MENU_MESSAGE }}  # optional; omit to use default in code
+        run: python monitor_lunchdrop.py
