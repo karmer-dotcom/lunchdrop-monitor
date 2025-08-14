@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 from datetime import date, timedelta
 
+# Banner: show version + commit SHA if available
+SCRIPT_VERSION = "v3"
+GITHUB_SHA = os.getenv("GITHUB_SHA", "")[:7]
+print(f"🚀 Lunchdrop monitor {SCRIPT_VERSION}  commit={GITHUB_SHA or 'local'}")
+
 # dotenv is optional (nice for local runs). On GitHub Actions we use env/secrets.
 try:
     from dotenv import load_dotenv  # type: ignore
