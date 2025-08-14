@@ -50,7 +50,7 @@ jobs:
           VERBOSE: "true"
           NO_MENU_MESSAGE: ${{ vars.NO_MENU_MESSAGE }}  # optional; omit to use default in code
           SUMMARY_ONLY: "true"       # <— enables the summary mode
-              run: python monitor_lunchdrop.py
+        run: python monitor_lunchdrop.py
       
       - name: Upload artifacts (if any)
         if: always()
