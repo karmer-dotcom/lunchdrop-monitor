@@ -12,12 +12,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Python with built-in pip cache
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"            # ✅ Cache pip dependencies
+          cache: "pip"
 
+      # Cache Playwright browsers so downloads are fast after the first run
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
@@ -33,6 +35,22 @@ jobs:
           python -m playwright install-deps
           python -m playwright install chromium
 
+      # Show exactly what the runner is using
+      - name: Show commit and script head
+        run: |
+          echo "Commit from runner: $GITHUB_SHA"
+          echo "----- First 20 lines of monitor_lunchdrop.py -----"
+          sed -n '1,20p' monitor_lunchdrop.py
+
+      # Optional: sanity ping Slack to confirm webhook works from Actions
+      - name: Slack sanity ping
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data '{"text":"✅ GitHub Actions can reach Slack (sanity ping)."}' \
+            "$SLACK_WEBHOOK_URL"
+
       - name: Run monitor
         env:
           BASE_URL: ${{ secrets.BASE_URL }}
@@ -43,6 +61,6 @@ jobs:
           HEADLESS: "true"
           VERBOSE: "true"
           SEND_EMPTY_SLACK: "true"
-          CSS_CARD_SELECTORS: ${{ secrets.CSS_CARD_SELECTORS }}
-          MIN_CARD_COUNT: ${{ secrets.MIN_CARD_COUNT }}
+          CSS_CARD_SELECTORS: ""         # force fallback (no selector) while testing
+          MIN_CARD_COUNT: "1"
         run: python monitor_lunchdrop.py
