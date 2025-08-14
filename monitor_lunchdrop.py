@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Lunchdrop Future Menus Monitor — v7.2
+Lunchdrop Future Menus Monitor — v7.3
 - Direct sign-in URL, persisted auth (storage_state) reused across dates
+- Skips weekends (Mon–Fri only)
+- SUMMARY_ONLY mode: post a Slack roll-up of current availability + names
 - Availability: positive-first (buttons "Show/View Menu"), else message-based (normalized)
 - Names: heuristic extraction (buttons -> nearest card -> heading/first line)
-- Always Slack; artifacts on "no menus" and auth failures
+- Always Slack in normal mode; artifacts on "no menus" and auth failures
 """
 
 import os, hashlib, json, time, re, string
@@ -13,7 +15,7 @@ from typing import Optional, Tuple
 from datetime import date, timedelta
 
 # ----- Banner -----
-SCRIPT_VERSION = "v7.2"
+SCRIPT_VERSION = "v7.3"
 GITHUB_SHA = os.getenv("GITHUB_SHA", "")[:7]
 print(f"🚀 Lunchdrop monitor {SCRIPT_VERSION}  commit={GITHUB_SHA or 'local'}")
 
@@ -33,18 +35,16 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 LUNCHDROP_EMAIL = os.getenv("LUNCHDROP_EMAIL")
 LUNCHDROP_PASSWORD = os.getenv("LUNCHDROP_PASSWORD")
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "14"))
+SUMMARY_ONLY = os.getenv("SUMMARY_ONLY", "false").lower() == "true"
 
 # Sign-in URL: default guesses <root>/signin. Override via env if needed.
-# If BASE_URL is https://austin.lunchdrop.com/app, SIGNIN_URL defaults to https://austin.lunchdrop.com/signin
 def infer_signin_url(base: str) -> str:
     try:
         from urllib.parse import urlsplit, urlunsplit
         sp = urlsplit(base)
-        # remove trailing /app if present
         path = sp.path
         if path.endswith("/app"):
             path = path[:-4]
-        # ensure trailing slash or empty
         root = urlunsplit((sp.scheme, sp.netloc, path.rstrip("/"), "", ""))
         return f"{root}/signin"
     except Exception:
@@ -316,8 +316,17 @@ def check_date_with_auth(browser, d: date) -> dict:
 
 # ----- Main -----
 def main():
-    future_dates = [date.today() + timedelta(days=i) for i in range(1, LOOKAHEAD_DAYS + 1)]
-    print(f"📆 Window: {future_dates[0].isoformat()} → {future_dates[-1].isoformat()}  (days={LOOKAHEAD_DAYS})")
+    # Only include weekdays (Mon=0 .. Fri=4)
+    weekdays = [
+        date.today() + timedelta(days=i)
+        for i in range(1, LOOKAHEAD_DAYS + 1)
+        if (date.today() + timedelta(days=i)).weekday() < 5
+    ]
+    if not weekdays:
+        print("ℹ️ No weekdays in the requested lookahead window.")
+        return
+
+    print(f"📆 Window (weekdays only): {weekdays[0].isoformat()} → {weekdays[-1].isoformat()}  (days={len(weekdays)})")
     print(f"ℹ️ SIGNIN_URL={SIGNIN_URL}")
     print(f"ℹ️ Using no-menu message (normalized contains): “{NO_MENU_MESSAGE}”")
 
@@ -340,8 +349,41 @@ def main():
             browser.close()
             return
 
-        # 2) Check each future date with persisted auth
-        for d in future_dates:
+        # --- SUMMARY-ONLY MODE ---
+        if SUMMARY_ONLY:
+            print("📝 SUMMARY_ONLY=true — collecting names per weekday and posting to Slack…")
+            results = []
+            for d in weekdays:
+                r = check_date_with_auth(browser, d)
+                if "error" in r:
+                    results.append((d, r["url"], False, [], r["error"]))
+                else:
+                    results.append((d, r["url"], r["available"], r.get("names", []), None))
+            browser.close()
+
+            blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*🍱 Lunchdrop summary (weekdays)*"}}]
+            for d, url, avail, names, err in results:
+                if err:
+                    line = f"*{d.isoformat()}* — <{url}|view> — ⚠️ error: `{err}`"
+                elif avail:
+                    if names:
+                        shown = names[:8]
+                        extra = len(names) - len(shown)
+                        line = f"*{d.isoformat()}* — <{url}|view> — " + ", ".join(shown)
+                        if extra > 0:
+                            line += f"  _(+{extra} more)_"
+                    else:
+                        line = f"*{d.isoformat()}* — <{url}|view> — *(available, names not detected)*"
+                else:
+                    line = f"*{d.isoformat()}* — <{url}|view> — _not available_"
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": line}})
+
+            notify_slack("Lunchdrop summary (weekdays)", blocks)
+            print("📣 Posted summary to Slack. Exiting.")
+            return
+
+        # --- NORMAL MODE (diff + alerts) ---
+        for d in weekdays:
             r = check_date_with_auth(browser, d)
             url = r["url"]
             if "error" in r:
@@ -387,7 +429,7 @@ def main():
     else:
         blocks = [
             {"type":"section","text":{"type":"mrkdwn","text":"*✅ Lunchdrop monitor ran — no new future menus to report.*"}},
-            {"type":"context","elements":[{"type":"mrkdwn","text":f"Window: {future_dates[0]} → {future_dates[-1]}"}]}
+            {"type":"context","elements":[{"type":"mrkdwn","text":f"Window: {weekdays[0]} → {weekdays[-1]} (weekdays only)"}]}
         ]
         notify_slack("Lunchdrop monitor heartbeat — no new menus", blocks)
         print("📣 Sent heartbeat to Slack.")
