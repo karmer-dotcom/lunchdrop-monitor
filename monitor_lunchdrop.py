@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Lunchdrop Future Menus Monitor — v4 (message-based detection, always Slack)
-- Detects menus by checking for the absence of the "no menus yet" message.
-- Always sends a Slack message (new menus OR heartbeat).
+Lunchdrop Future Menus Monitor — v5
+- Availability: message-based (absent => menus available).
+- Names: heuristic extraction (buttons "Show/View Menu" -> nearest card -> heading).
+- Always sends Slack (new menus OR heartbeat).
 """
 
-import os, hashlib, json, time
+import os, hashlib, json, time, re
 from pathlib import Path
 from typing import Optional, Tuple
 from datetime import date, timedelta
 
 # Banner: show version + commit SHA if available
-SCRIPT_VERSION = "v4"
+SCRIPT_VERSION = "v5"
 GITHUB_SHA = os.getenv("GITHUB_SHA", "")[:7]
 print(f"🚀 Lunchdrop monitor {SCRIPT_VERSION}  commit={GITHUB_SHA or 'local'}")
 
-# Optional dotenv for local runs; in Actions we use env/secrets
+# Optional dotenv for local runs
 try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv()
@@ -34,7 +35,7 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 LUNCHDROP_EMAIL = os.getenv("LUNCHDROP_EMAIL")
 LUNCHDROP_PASSWORD = os.getenv("LUNCHDROP_PASSWORD")
 
-# Message shown when no menus exist yet (case-insensitive match)
+# Message shown when no menus exist yet (case-insensitive)
 NO_MENU_MESSAGE = os.getenv(
     "NO_MENU_MESSAGE",
     "The restaurants for this day will be scheduled shortly."
@@ -121,13 +122,12 @@ def ensure_logged_in(page):
     except PlaywrightTimeoutError:
         print("⚠️ Login timeout; continuing anyway.")
 
-def detect_availability_and_digest(page) -> Tuple[bool, str]:
+def detect_availability_and_digest(page) -> Tuple[bool, str, str]:
     """
     Heuristic: if NO_MENU_MESSAGE appears (case-insensitive) => no menus.
                else => menus are available.
-    Returns: (available, digest_of_page_text)
+    Returns: (available, digest_of_page_text, normalized_text)
     """
-    # Prefer main; fall back to body
     txt = ""
     try:
         if page.locator("main").count() > 0:
@@ -140,11 +140,61 @@ def detect_availability_and_digest(page) -> Tuple[bool, str]:
         except Exception:
             txt = ""
 
-    norm = stable_text(txt).lower()
-    available = NO_MENU_MESSAGE.lower() not in norm
-    digest = content_hash(norm)
+    norm = stable_text(txt)
+    available = NO_MENU_MESSAGE.lower() not in norm.lower()
+    digest = content_hash(norm.lower())
     print(f"🔎 Message check: available={available}  digest={digest[:10]}…")
-    return available, digest
+    return available, digest, norm
+
+def extract_restaurant_names(page) -> list[str]:
+    """
+    Robust attempts to pull restaurant names.
+    Strategy A: find "Show/View Menu" buttons, walk up to nearest card-like container, prefer heading text.
+    Strategy B: fallback — grab short headings on the page that don’t look like generic 'menu' text.
+    """
+    names = set()
+
+    # Strategy A
+    try:
+        buttons = page.get_by_role("button", name=re.compile(r"(show|view)\s*menu", re.I)).all()
+        for b in buttons:
+            try:
+                # nearest plausible card container
+                container = b.locator(
+                    "xpath=ancestor::*[self::article or self::section or contains(@class,'card') or contains(@class,'Card')][1]"
+                )
+                # prefer an explicit heading
+                head = container.get_by_role("heading").first
+                name = ""
+                if head.count() > 0:
+                    name = head.inner_text(timeout=2000).strip()
+                else:
+                    # fallback: first non-empty line of container text that isn't the button
+                    txt = container.inner_text(timeout=2000)
+                    for line in (l.strip() for l in txt.splitlines()):
+                        if line and not re.search(r"(show|view)\s*menu", line, re.I):
+                            name = line; break
+                if name:
+                    names.add(stable_text(name))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Strategy B (fallback)
+    if not names:
+        try:
+            for h in page.get_by_role("heading").all():
+                try:
+                    t = h.inner_text(timeout=1500).strip()
+                    if t and len(t) <= 60 and not re.search(r"\bmenu\b", t, re.I):
+                        names.add(stable_text(t))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    return sorted(n for n in names if n)
 
 def check_date(browser, d: date) -> dict:
     url = url_for(d)
@@ -162,8 +212,16 @@ def check_date(browser, d: date) -> dict:
         page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
         time.sleep(1.5)  # let client JS render
 
-        available, digest = detect_availability_and_digest(page)
-        return {"url": url, "available": available, "digest": digest}
+        available, digest, _norm = detect_availability_and_digest(page)
+        names = []
+        if available:
+            try:
+                names = extract_restaurant_names(page)
+                print(f"🍽️  Found {len(names)} restaurant name(s): {', '.join(names[:6])}{'…' if len(names)>6 else ''}")
+            except Exception as e:
+                print(f"⚠️ name extraction failed: {e}")
+
+        return {"url": url, "available": available, "digest": digest, "names": names}
     except PlaywrightTimeoutError:
         return {"url": url, "error": f"Timeout loading {url}"}
     except Exception as e:
@@ -196,30 +254,39 @@ def main():
                 errors.append(r["error"])
                 continue
 
-            available_now = r["available"]
-            digest_now = r["digest"]
-
+            snap_now = {"available": r["available"], "digest": r["digest"], "names": r.get("names", [])}
             prev = load_state(url) or {}
             prev_available = prev.get("available")
             prev_digest = prev.get("digest")
+            prev_names = set(prev.get("names", []))
+            now_names = set(snap_now.get("names", []))
 
-            save_state(url, {"available": available_now, "digest": digest_now})
+            save_state(url, snap_now)
 
-            # Alert when a day first becomes available or its content changes while available
-            if (prev_available in (None, False)) and available_now:
-                newly_available.append((d, url))
-                print(f"🎉 NEW: {d.isoformat()} became available")
-            elif available_now and prev_digest and prev_digest != digest_now:
-                newly_available.append((d, url))
-                print(f"🔁 UPDATED: {d.isoformat()} content changed")
+            became_available = (prev_available in (None, False)) and snap_now["available"]
+            names_added = sorted(now_names - prev_names)
+
+            if became_available:
+                newly_available.append((d, url, names_added or sorted(now_names)))
+                print(f"🎉 NEW: {d.isoformat()} became available; names={', '.join(names_added or now_names)}")
+            elif snap_now["available"] and prev_digest and prev_digest != snap_now["digest"]:
+                newly_available.append((d, url, names_added))
+                print(f"🔁 UPDATED: {d.isoformat()} content changed; +{len(names_added)} name(s)")
 
         browser.close()
 
     # Always send Slack
     if newly_available:
         blocks = [{"type":"section","text":{"type":"mrkdwn","text":"*🎉 New future Lunchdrop dates available:*"}}]
-        for d, url in newly_available:
-            blocks.append({"type":"section","text":{"type":"mrkdwn","text":f"• *{d.isoformat()}* — <{url}|view>"}})
+        for d, url, names_added in newly_available:
+            line = f"• *{d.isoformat()}* — <{url}|view>"
+            if names_added:
+                shown = names_added[:6]
+                extra = len(names_added) - len(shown)
+                line += " — " + ", ".join(shown)
+                if extra > 0:
+                    line += f"  _(+{extra} more)_"
+            blocks.append({"type":"section","text":{"type":"mrkdwn","text": line}})
         notify_slack("New future Lunchdrop dates available", blocks)
         print(f"📣 Notified Slack: {len(newly_available)} date(s)")
     else:
