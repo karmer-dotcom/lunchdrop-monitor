@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Lunchdrop Future Menus Monitor — v6
-- Availability: positive-first (buttons "Show/View Menu"), else message-based (absent => menus available).
-- Normalized text comparison for robustness (case/punctuation/whitespace).
-- Names: heuristic extraction (buttons -> nearest card -> heading / first line).
-- Always sends Slack (new menus OR heartbeat).
-- Saves artifacts (screenshot + HTML) when a page is judged "no menus".
+Lunchdrop Future Menus Monitor — v7
+- One login at BASE_URL, persist cookies (storage_state) to .auth/state.json
+- Use that auth for every date (no more sign-in artifacts)
+- Availability: positive-first (buttons "Show/View Menu"), else message-based
+- Robust text normalization; restaurant name extraction
+- Always Slack; save artifacts when page judged "no menus"
 """
 
 import os, hashlib, json, time, re, string
@@ -13,12 +13,12 @@ from pathlib import Path
 from typing import Optional, Tuple
 from datetime import date, timedelta
 
-# Banner: show version + commit SHA if available
-SCRIPT_VERSION = "v6"
+# Banner
+SCRIPT_VERSION = "v7"
 GITHUB_SHA = os.getenv("GITHUB_SHA", "")[:7]
 print(f"🚀 Lunchdrop monitor {SCRIPT_VERSION}  commit={GITHUB_SHA or 'local'}")
 
-# Optional dotenv for local runs
+# Optional dotenv (local)
 try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv()
@@ -37,14 +37,16 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 LUNCHDROP_EMAIL = os.getenv("LUNCHDROP_EMAIL")
 LUNCHDROP_PASSWORD = os.getenv("LUNCHDROP_PASSWORD")
 
-# Shorter "no menus yet" phrase; normalized compare below
+# Shorter phrase, normalized compare
 NO_MENU_MESSAGE = os.getenv(
     "NO_MENU_MESSAGE",
     "restaurants for this day will be scheduled shortly"
 ).strip().lower()
 
 STATE_DIR = Path(os.getenv("STATE_DIR", ".ld_state"))
-ART_DIR = Path(os.getenv("ART_DIR", "artifacts"))  # where we drop screenshots/HTML on no-menu
+AUTH_DIR = Path(os.getenv("AUTH_DIR", ".auth"))
+AUTH_STATE = AUTH_DIR / "state.json"
+ART_DIR = Path(os.getenv("ART_DIR", "artifacts"))
 TIMEOUT_MS = int(os.getenv("TIMEOUT_MS", "25000"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 VERBOSE = os.getenv("VERBOSE", "true").lower() == "true"
@@ -56,8 +58,8 @@ missing = [k for k, v in {
 if missing:
     raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
 
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-ART_DIR.mkdir(parents=True, exist_ok=True)
+for d in (STATE_DIR, AUTH_DIR, ART_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
 # --------------------
 # Helpers
@@ -77,7 +79,6 @@ def stable_text(s: str) -> str:
     return " ".join(s.split())
 
 def normalize(s: str) -> str:
-    """lowercase, strip punctuation, collapse whitespace"""
     table = str.maketrans("", "", string.punctuation)
     return " ".join(s.lower().translate(table).split())
 
@@ -104,35 +105,86 @@ def load_state(url: str) -> Optional[dict]:
     return None
 
 # --------------------
-# Auth & detection
+# Auth (persisted)
 # --------------------
 SIGNIN_SELECTORS = ["input[type=email]", "input[name=email]", "input[name=username]"]
 PASSWORD_SELECTORS = ["input[type=password]", "input[name=password]"]
-SUBMIT_SELECTORS = ["button:has-text('Sign in')", "button:has-text('Sign In')", "button[type=submit]"]
+SUBMIT_SELECTORS = [
+    "button:has-text('Sign in')",
+    "button:has-text('Sign In')",
+    "button:has-text('Log in')",
+    "button:has-text('Log In')",
+    "button[type=submit']",
+    "button[type=submit]"
+]
 
-def ensure_logged_in(page):
-    """Fill email/password and submit if a login form is present."""
+def try_click_any(page, selectors: list[str]) -> bool:
+    for sel in selectors:
+        if page.locator(sel).count() > 0:
+            page.click(sel)
+            return True
+    return False
+
+def ensure_logged_in_and_save_state(browser) -> None:
+    """
+    Open BASE_URL, perform login once (if needed), then save storage_state to AUTH_STATE.
+    """
+    ctx = browser.new_context()
+    page = ctx.new_page()
+    print(f"🔐 Auth check at {BASE_URL}")
     try:
+        page.goto(BASE_URL, timeout=TIMEOUT_MS)
+        page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+
+        # Some sites show a "Sign in" landing button first; click it if present
+        try_click_any(page, [
+            "a:has-text('Sign in')", "a:has-text('Sign In')",
+            "button:has-text('Sign in')", "button:has-text('Sign In')"
+        ])
+
+        # If login form visible, fill and submit
         if any(page.locator(sel).count() > 0 for sel in PASSWORD_SELECTORS + SIGNIN_SELECTORS):
-            print("🔐 Logging in…")
+            print("🧾 Login form detected; attempting login…")
+            # email/username
             for sel in SIGNIN_SELECTORS:
                 if page.locator(sel).count() > 0:
                     page.fill(sel, LUNCHDROP_EMAIL); break
+            # password
             for sel in PASSWORD_SELECTORS:
                 if page.locator(sel).count() > 0:
                     page.fill(sel, LUNCHDROP_PASSWORD); break
-            for sel in SUBMIT_SELECTORS:
-                if page.locator(sel).count() > 0:
-                    page.click(sel); break
-            page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-            print("✅ Logged in (attempt complete).")
-        else:
-            log("No login form detected; continuing.")
-    except PlaywrightTimeoutError:
-        print("⚠️ Login timeout; continuing anyway.")
+            # submit via button or Enter
+            if not try_click_any(page, SUBMIT_SELECTORS):
+                page.keyboard.press("Enter")
 
+            # Wait for the app to load
+            page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+            page.wait_for_timeout(1500)
+            print("✅ Login submitted.")
+
+        # Revisit BASE_URL to ensure app view
+        page.goto(BASE_URL, timeout=TIMEOUT_MS)
+        page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+        page.wait_for_timeout(1000)
+
+        # Assert we're not on the login form anymore
+        still_login = any(page.locator(sel).count() > 0 for sel in PASSWORD_SELECTORS + SIGNIN_SELECTORS)
+        if still_login:
+            # Save artifact for debugging
+            page.screenshot(path=str(ART_DIR / "auth-failed-screen.png"), full_page=True)
+            (ART_DIR / "auth-failed-page.html").write_text(page.content(), encoding="utf-8")
+            raise RuntimeError("Login still showing fields after submit")
+
+        # Save storage state for reuse
+        ctx.storage_state(path=str(AUTH_STATE))
+        print(f"🔒 Auth state saved to {AUTH_STATE}")
+    finally:
+        ctx.close()
+
+# --------------------
+# Detection & names
+# --------------------
 def positive_menu_hits(page) -> int:
-    """Count accessible 'Show/View Menu' buttons."""
     hits = 0
     try:
         hits += page.get_by_role("button", name=re.compile(r"(show|view)\s*menu", re.I)).count()
@@ -141,12 +193,6 @@ def positive_menu_hits(page) -> int:
     return hits
 
 def detect_availability_and_digest(page) -> Tuple[bool, str, str]:
-    """
-    Positive-first: if any 'Show/View Menu' buttons exist => available.
-    Else: message-based — if NO_MENU_MESSAGE present (normalized) => not available; else available.
-    Returns: (available, digest_of_normalized_text, raw_text_for_ref)
-    """
-    # Grab text from main/body
     txt = ""
     try:
         if page.locator("main").count() > 0:
@@ -168,22 +214,15 @@ def detect_availability_and_digest(page) -> Tuple[bool, str, str]:
         reason = f"positive buttons (hits={hits})"
     else:
         available = NO_MENU_MESSAGE in norm_cmp
-        available = not available  # invert: presence of no-menu => not available
+        available = not available  # invert
         reason = "message check"
 
     digest = content_hash(norm_cmp)
-    print(f"🔎 Availability: {available}  via {reason}; digest={digest[:10]}…")
+    print(f"🔎 Availability: {available} via {reason}; digest={digest[:10]}…")
     return available, digest, norm_full
 
 def extract_restaurant_names(page) -> list[str]:
-    """
-    Robust attempts to pull restaurant names.
-    Strategy A: find "Show/View Menu" buttons, walk up to nearest card-like container, prefer heading text.
-    Strategy B: fallback — grab short headings on the page that don’t look like generic 'menu' text.
-    """
     names = set()
-
-    # Strategy A
     try:
         buttons = page.get_by_role("button", name=re.compile(r"(show|view)\s*menu", re.I)).all()
         for b in buttons:
@@ -207,7 +246,6 @@ def extract_restaurant_names(page) -> list[str]:
     except Exception:
         pass
 
-    # Strategy B (fallback)
     if not names:
         try:
             for h in page.get_by_role("heading").all():
@@ -222,20 +260,19 @@ def extract_restaurant_names(page) -> list[str]:
 
     return sorted(n for n in names if n)
 
-def check_date(browser, d: date) -> dict:
+# --------------------
+# Per-date check (uses persisted auth)
+# --------------------
+def check_date_with_auth(browser, d: date) -> dict:
     url = url_for(d)
-    ctx = browser.new_context()
+    # Use stored auth for each new context
+    ctx = browser.new_context(storage_state=str(AUTH_STATE) if AUTH_STATE.exists() else None)
     page = ctx.new_page()
     try:
         print(f"📅 Checking {d.isoformat()} → {url}")
         page.goto(url, timeout=TIMEOUT_MS)
         page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-        ensure_logged_in(page)
-
-        # Revisit the date URL post-auth and allow extra settle time
-        page.goto(url, timeout=TIMEOUT_MS)
-        page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-        page.wait_for_timeout(2000)  # extra settle for client rendering
+        page.wait_for_timeout(2000)  # settle
 
         available, digest, _norm = detect_availability_and_digest(page)
 
@@ -247,7 +284,6 @@ def check_date(browser, d: date) -> dict:
             except Exception as e:
                 print(f"⚠️ name extraction failed: {e}")
         else:
-            # Save artifacts to debug false negatives
             png_path = ART_DIR / f"{d.isoformat()}-screen.png"
             html_path = ART_DIR / f"{d.isoformat()}-page.html"
             try:
@@ -277,13 +313,26 @@ def main():
     errors = []
 
     with sync_playwright() as p:
+        # Browser
         try:
             browser = p.chromium.launch(channel="chrome", headless=HEADLESS)
         except Exception:
             browser = p.chromium.launch(headless=HEADLESS)
 
+        # 1) Ensure we’re logged in ONCE and save auth state
+        try:
+            ensure_logged_in_and_save_state(browser)
+        except Exception as e:
+            print(f"❌ Login failed: {e}")
+            # If login fails, we still try dates (will capture sign-in artifacts)
+            # Optionally, notify Slack here about auth failure:
+            notify_slack(f"❌ Lunchdrop monitor login failed: {e}")
+            browser.close()
+            return
+
+        # 2) Check dates using persisted auth
         for d in future_dates:
-            r = check_date(browser, d)
+            r = check_date_with_auth(browser, d)
             url = r["url"]
             if "error" in r:
                 print(f"⚠️ {r['error']}")
