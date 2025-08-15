@@ -66,6 +66,7 @@ jobs:
           VERBOSE: "true"
           NO_MENU_MESSAGE: ${{ vars.NO_MENU_MESSAGE }}  # optional; omit to use default in code
           SUMMARY_ONLY: "false"       # <— enables the summary mode
+          SEND_HEARTBEAT: "true"
         run: python monitor_lunchdrop.py
       
       - name: Upload artifacts (if any)
