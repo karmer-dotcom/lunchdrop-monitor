@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lunchdrop Future Menus Monitor — v7.5
+Lunchdrop Future Menus Monitor — v7.6
 - Parse Inertia payload (#app[data-page]) for reliable availability + names
 - Direct sign-in URL, persisted auth (storage_state) reused across dates
 - Skips weekends (Mon–Fri only)
@@ -35,6 +35,7 @@ LUNCHDROP_EMAIL = os.getenv("LUNCHDROP_EMAIL")
 LUNCHDROP_PASSWORD = os.getenv("LUNCHDROP_PASSWORD")
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "14"))
 SUMMARY_ONLY = os.getenv("SUMMARY_ONLY", "false").lower() == "true"
+SEND_HEARTBEAT = os.getenv("SEND_HEARTBEAT", "true").lower() == "true"
 
 # Sign-in URL: default guesses <root>/signin. Override via env if needed.
 def infer_signin_url(base: str) -> str:
@@ -391,12 +392,15 @@ def main():
         notify_slack("New future Lunchdrop dates available", blocks)
         print(f"📣 Notified Slack: {len(newly_available)} date(s)")
     else:
+    if SEND_HEARTBEAT:
         blocks = [
             {"type":"section","text":{"type":"mrkdwn","text":"*✅ Lunchdrop monitor ran — no new future menus to report.*"}},
             {"type":"context","elements":[{"type":"mrkdwn","text":f"Window: {weekdays[0]} → {weekdays[-1]} (weekdays only)"}]}
         ]
         notify_slack("Lunchdrop monitor heartbeat — no new menus", blocks)
         print("📣 Sent heartbeat to Slack.")
+    else:
+        print("ℹ️ No new menus and heartbeat disabled — nothing sent to Slack.")
 
     for e in errors:
         print(f"[warn] {e}")
