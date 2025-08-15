@@ -391,7 +391,7 @@ def main():
             blocks.append({"type":"section","text":{"type":"mrkdwn","text": line}})
         notify_slack("New future Lunchdrop dates available", blocks)
         print(f"📣 Notified Slack: {len(newly_available)} date(s)")
-    else:
+else:
     if SEND_HEARTBEAT:
         blocks = [
             {"type":"section","text":{"type":"mrkdwn","text":"*✅ Lunchdrop monitor ran — no new future menus to report.*"}},
