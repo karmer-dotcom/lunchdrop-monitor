@@ -184,10 +184,13 @@ def ensure_logged_in_and_save_state(browser) -> None:
         ctx.close()
 
 # ----- Payload-based detection -----
-def detect_availability_and_names_from_payload(page) -> tuple[bool, list[str], str]:
+def detect_availability_and_deliveries(page) -> tuple[bool, list[dict], str]:
     """
-    Parse Lunchdrop Inertia payload for open deliveries + names.
-    Returns (available, names, digest_string).
+    Parse Lunchdrop Inertia payload for open deliveries.
+    Returns:
+      available: bool
+      deliveries: list of dicts {name, url}
+      digest: str
     """
     try:
         page.wait_for_selector('#app[data-page]', timeout=TIMEOUT_MS)
@@ -206,17 +209,19 @@ def detect_availability_and_names_from_payload(page) -> tuple[bool, list[str], s
             d for d in deliveries
             if (d.get("isOpen") in (1, True)) and not d.get("isCancelled") and d.get("userCanOrder", True)
         ]
-        names = [
-            d.get("restaurantName") or (d.get("restaurant") or {}).get("name", "")
-            for d in open_deliveries
-        ]
-        names = sorted(set(filter(None, names)))
 
-        # digest: hash a minimal stable representation of open deliveries
-        minimal = [{"name": n} for n in names]
-        digest = content_hash(json.dumps(minimal, sort_keys=True))
+        # Build name+url list
+        info = []
+        for d in open_deliveries:
+            name = d.get("restaurantName") or (d.get("restaurant") or {}).get("name", "")
+            url = d.get("url") or d.get("link") or ""
+            if name:
+                info.append({"name": name, "url": url})
 
-        return bool(open_deliveries), names, digest
+        # Digest just from names to detect changes
+        digest = content_hash(json.dumps(sorted([i["name"] for i in info]), sort_keys=True))
+
+        return bool(open_deliveries), info, digest
     except Exception as e:
         print(f"⚠️ payload parse failed: {e}")
         return False, [], content_hash("")
@@ -232,8 +237,8 @@ def check_date_with_auth(browser, d: date) -> dict:
         page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
         page.wait_for_timeout(1000)
 
-        available, names, digest = detect_availability_and_names_from_payload(page)
-
+available, deliveries, digest = detect_availability_and_deliveries(page)
+names = [d["name"] for d in deliveries]
         if available:
             print(f"🍽️  Found {len(names)} restaurant name(s): {', '.join(names)}")
         else:
@@ -247,7 +252,8 @@ def check_date_with_auth(browser, d: date) -> dict:
             except Exception as e:
                 print(f"⚠️ artifact save failed: {e}")
 
-        return {"url": url, "available": available, "digest": digest, "names": names}
+        return {"url": url, "available": available, "digest": digest, "names": names, "deliveries": deliveries}
+
     except PlaywrightTimeoutError:
         return {"url": url, "error": f"Timeout loading {url}"}
     except Exception as e:
@@ -302,21 +308,22 @@ def main():
             browser.close()
 
             blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*🍱 Lunchdrop summary (weekdays)*"}}]
-            for d, url, avail, names, err in results:
-                if err:
-                    line = f"*{d.isoformat()}* — <{url}|view> — ⚠️ error: `{err}`"
-                elif avail:
-                    if names:
-                        shown = names[:8]
-                        extra = len(names) - len(shown)
-                        line = f"*{d.isoformat()}* — <{url}|view> — " + ", ".join(shown)
-                        if extra > 0:
-                            line += f"  _(+{extra} more)_"
-                    else:
-                        line = f"*{d.isoformat()}* — <{url}|view> — *(available, names not detected)*"
+           for d, url, avail, names, err in results:
+    if err:
+        line = f"*{d.isoformat()}* — <{url}|view> — ⚠️ error: `{err}`"
+    elif avail:
+        if deliveries:
+            parts = []
+            for r in deliveries:
+                if r["url"]:
+                    parts.append(f"{r['name']} (<{r['url']}|order>)")
                 else:
-                    line = f"*{d.isoformat()}* — <{url}|view> — _not available_"
-                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": line}})
+                    parts.append(r["name"])
+            line = f"*{d.isoformat()}* — <{url}|view> — " + ", ".join(parts)
+        else:
+            line = f"*{d.isoformat()}* — <{url}|view> — *(available, names not detected)*"
+    else:
+        line = f"*{d.isoformat()}* — <{url}|view> — _not available_"
 
             notify_slack("Lunchdrop summary (weekdays)", blocks)
             print("📣 Posted summary to Slack. Exiting.")
@@ -356,14 +363,17 @@ def main():
     if newly_available:
         blocks = [{"type":"section","text":{"type":"mrkdwn","text":"*🎉 New future Lunchdrop dates available:*"}}]
         for d, url, names_added in newly_available:
-            line = f"• *{d.isoformat()}* — <{url}|view>"
-            if names_added:
-                shown = names_added[:6]
-                extra = len(names_added) - len(shown)
-                line += " — " + ", ".join(shown)
-                if extra > 0:
-                    line += f"  _(+{extra} more)_"
-            blocks.append({"type":"section","text":{"type":"mrkdwn","text": line}})
+    deliveries = snap_now.get("deliveries", [])
+    parts = []
+    for r in deliveries:
+        if r["url"]:
+            parts.append(f"{r['name']} (<{r['url']}|order>)")
+        else:
+            parts.append(r["name"])
+    line = f"• *{d.isoformat()}* — <{url}|view>"
+    if parts:
+        line += " — " + ", ".join(parts)
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": line}})
         notify_slack("New future Lunchdrop dates available", blocks)
         print(f"📣 Notified Slack: {len(newly_available)} date(s)")
     else:
