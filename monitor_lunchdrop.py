@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Lunchdrop Future Menus Monitor — v7.3
+Lunchdrop Future Menus Monitor — v7.4
+- Parse Inertia payload (#app[data-page]) for reliable availability + names
 - Direct sign-in URL, persisted auth (storage_state) reused across dates
 - Skips weekends (Mon–Fri only)
-- SUMMARY_ONLY mode: post a Slack roll-up of current availability + names
-- Availability: positive-first (buttons "Show/View Menu"), else message-based (normalized)
-- Names: heuristic extraction (buttons -> nearest card -> heading/first line)
-- Always Slack in normal mode; artifacts on "no menus" and auth failures
+- SUMMARY_ONLY mode: Slack roll-up of current availability + names
+- Normal mode: diff detection + alerts; artifacts on auth failure or "no menus"
 """
 
 import os, hashlib, json, time, re, string
@@ -15,7 +14,7 @@ from typing import Optional, Tuple
 from datetime import date, timedelta
 
 # ----- Banner -----
-SCRIPT_VERSION = "v7.3"
+SCRIPT_VERSION = "v7.4"
 GITHUB_SHA = os.getenv("GITHUB_SHA", "")[:7]
 print(f"🚀 Lunchdrop monitor {SCRIPT_VERSION}  commit={GITHUB_SHA or 'local'}")
 
@@ -52,12 +51,6 @@ def infer_signin_url(base: str) -> str:
 
 SIGNIN_URL = os.getenv("SIGNIN_URL", infer_signin_url(BASE_URL)).rstrip("/")
 
-# No-menus message (normalized comparison)
-NO_MENU_MESSAGE = os.getenv(
-    "NO_MENU_MESSAGE",
-    "restaurants for this day will be scheduled shortly"
-).strip().lower()
-
 # Runtime + paths
 STATE_DIR = Path(os.getenv("STATE_DIR", ".ld_state"))
 AUTH_DIR = Path(os.getenv("AUTH_DIR", ".auth"))
@@ -73,6 +66,10 @@ missing = [k for k, v in {
 }.items() if not v]
 if missing:
     raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
+
+# Guard for sign-in URL
+if not SIGNIN_URL.startswith("http"):
+    raise SystemExit(f"SIGNIN_URL invalid: {SIGNIN_URL!r} — set SIGNIN_URL=https://austin.lunchdrop.com/signin")
 
 for d in (STATE_DIR, AUTH_DIR, ART_DIR):
     d.mkdir(parents=True, exist_ok=True)
@@ -91,10 +88,6 @@ def notify_slack(text: str, blocks: Optional[list] = None):
 
 def stable_text(s: str) -> str:
     return " ".join(s.split())
-
-def normalize(s: str) -> str:
-    table = str.maketrans("", "", string.punctuation)
-    return " ".join(s.lower().translate(table).split())
 
 def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -162,118 +155,71 @@ def ensure_logged_in_and_save_state(browser) -> None:
 
         if any(safe_has(page, s) for s in PASSWORD_SELECTORS + SIGNIN_SELECTORS):
             print("🧾 Login form detected; attempting login…")
-            # email/username
             for sel in SIGNIN_SELECTORS:
                 if safe_has(page, sel):
                     page.fill(sel, LUNCHDROP_EMAIL); break
-            # password
             for sel in PASSWORD_SELECTORS:
                 if safe_has(page, sel):
                     page.fill(sel, LUNCHDROP_PASSWORD); break
-            # submit via button or Enter
             if not try_click_any(page, SUBMIT_SELECTORS):
                 page.keyboard.press("Enter")
             page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
             page.wait_for_timeout(1500)
             print("✅ Login submitted.")
 
-        # Visit BASE_URL to ensure app loads and session sticks
+        # Visit BASE_URL to ensure app view
         page.goto(BASE_URL, timeout=TIMEOUT_MS)
         page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
         page.wait_for_timeout(1000)
 
-        # If we still see login form, fail and save artifacts
         still_login = any(safe_has(page, s) for s in PASSWORD_SELECTORS + SIGNIN_SELECTORS)
         if still_login:
             page.screenshot(path=str(ART_DIR / "auth-failed-screen.png"), full_page=True)
             (ART_DIR / "auth-failed-page.html").write_text(page.content(), encoding="utf-8")
             raise RuntimeError("Login still showing fields after submit")
 
-        # Persist auth
         ctx.storage_state(path=str(AUTH_STATE))
         print(f"🔒 Auth state saved to {AUTH_STATE}")
     finally:
         ctx.close()
 
-# ----- Detection & names -----
-def positive_menu_hits(page) -> int:
-    hits = 0
+# ----- Payload-based detection -----
+def detect_availability_and_names_from_payload(page) -> tuple[bool, list[str], str]:
+    """
+    Parse Lunchdrop Inertia payload for open deliveries + names.
+    Returns (available, names, digest_string).
+    """
     try:
-        hits += page.get_by_role("button", name=re.compile(r"(show|view)\s*menu", re.I)).count()
-    except Exception:
-        pass
-    return hits
+        page.wait_for_selector('#app[data-page]', timeout=TIMEOUT_MS)
+        raw = page.get_attribute('#app', 'data-page')
+        if not raw:
+            return False, [], content_hash("")
+        data = json.loads(raw)
 
-def detect_availability_and_digest(page) -> Tuple[bool, str, str]:
-    # Text from main/body
-    txt = ""
-    try:
-        if page.locator("main").count() > 0:
-            txt = page.locator("main").inner_text(timeout=4000)
-    except Exception:
-        pass
-    if not txt:
-        try:
-            txt = page.locator("body").inner_text(timeout=4000)
-        except Exception:
-            txt = ""
+        deliveries = (
+            data.get("props", {}).get("lunchDay", {}).get("deliveries")
+            or ([data["props"]["delivery"]] if data.get("props", {}).get("delivery") else [])
+            or []
+        )
 
-    norm_full = stable_text(txt)
-    norm_cmp = normalize(norm_full)
+        open_deliveries = [
+            d for d in deliveries
+            if (d.get("isOpen") in (1, True)) and not d.get("isCancelled") and d.get("userCanOrder", True)
+        ]
+        names = [
+            d.get("restaurantName") or (d.get("restaurant") or {}).get("name", "")
+            for d in open_deliveries
+        ]
+        names = sorted(set(filter(None, names)))
 
-    hits = positive_menu_hits(page)
-    if hits > 0:
-        available = True
-        reason = f"positive buttons (hits={hits})"
-    else:
-        available = NO_MENU_MESSAGE in norm_cmp
-        available = not available  # invert: presence of "no-menu" => not available
-        reason = "message check"
+        # digest: hash a minimal stable representation of open deliveries
+        minimal = [{"name": n} for n in names]
+        digest = content_hash(json.dumps(minimal, sort_keys=True))
 
-    digest = content_hash(norm_cmp)
-    print(f"🔎 Availability: {available} via {reason}; digest={digest[:10]}…")
-    return available, digest, norm_full
-
-def extract_restaurant_names(page) -> list[str]:
-    names = set()
-    # Strategy A: from buttons -> nearest card -> heading/first meaningful line
-    try:
-        buttons = page.get_by_role("button", name=re.compile(r"(show|view)\s*menu", re.I)).all()
-        for b in buttons:
-            try:
-                container = b.locator(
-                    "xpath=ancestor::*[self::article or self::section or contains(@class,'card') or contains(@class,'Card')][1]"
-                )
-                head = container.get_by_role("heading").first
-                name = ""
-                if head.count() > 0:
-                    name = head.inner_text(timeout=2000).strip()
-                else:
-                    txt = container.inner_text(timeout=2000)
-                    for line in (l.strip() for l in txt.splitlines()):
-                        if line and not re.search(r"(show|view)\s*menu", line, re.I):
-                            name = line; break
-                if name:
-                    names.add(stable_text(name))
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # Strategy B: fallback to short headings
-    if not names:
-        try:
-            for h in page.get_by_role("heading").all():
-                try:
-                    t = h.inner_text(timeout=1500).strip()
-                    if t and 2 <= len(t) <= 60 and not re.search(r"\bmenu\b", t, re.I):
-                        names.add(stable_text(t))
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-    return sorted(n for n in names if n)
+        return bool(open_deliveries), names, digest
+    except Exception as e:
+        print(f"⚠️ payload parse failed: {e}")
+        return False, [], content_hash("")
 
 # ----- Per-date check (reusing auth) -----
 def check_date_with_auth(browser, d: date) -> dict:
@@ -284,17 +230,12 @@ def check_date_with_auth(browser, d: date) -> dict:
         print(f"📅 Checking {d.isoformat()} → {url}")
         page.goto(url, timeout=TIMEOUT_MS)
         page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(1000)
 
-        available, digest, _norm = detect_availability_and_digest(page)
+        available, names, digest = detect_availability_and_names_from_payload(page)
 
-        names = []
         if available:
-            try:
-                names = extract_restaurant_names(page)
-                print(f"🍽️  Found {len(names)} restaurant name(s): {', '.join(names[:6])}{'…' if len(names)>6 else ''}")
-            except Exception as e:
-                print(f"⚠️ name extraction failed: {e}")
+            print(f"🍽️  Found {len(names)} restaurant name(s): {', '.join(names)}")
         else:
             # Save artifacts so we can see what page looked like
             png_path = ART_DIR / f"{d.isoformat()}-screen.png"
@@ -328,7 +269,6 @@ def main():
 
     print(f"📆 Window (weekdays only): {weekdays[0].isoformat()} → {weekdays[-1].isoformat()}  (days={len(weekdays)})")
     print(f"ℹ️ SIGNIN_URL={SIGNIN_URL}")
-    print(f"ℹ️ Using no-menu message (normalized contains): “{NO_MENU_MESSAGE}”")
 
     newly_available = []
     errors = []
