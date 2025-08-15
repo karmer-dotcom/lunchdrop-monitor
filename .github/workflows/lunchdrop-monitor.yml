@@ -42,7 +42,19 @@ jobs:
           echo "Commit from runner: $GITHUB_SHA"
           echo "----- First 20 lines of monitor_lunchdrop.py -----"
           sed -n '1,20p' monitor_lunchdrop.py
+      
+      - name: Cache state
+        uses: actions/cache@v4
+        with:
+          path: .ld_state
+          key: lunchdrop-state
 
+      - name: Cache auth state
+        uses: actions/cache@v4
+        with:
+          path: .auth
+          key: lunchdrop-auth
+          
       - name: Run monitor
         env:
           BASE_URL: ${{ secrets.BASE_URL }}
