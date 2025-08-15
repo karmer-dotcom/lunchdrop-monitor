@@ -374,7 +374,7 @@ def main():
         browser.close()
 
     # ----- Slack (normal mode) -----
-    if newly_available:
+if newly_available:
         # Put a single "click here to order" at the top, then day lines
         blocks = [{
             "type": "section",
@@ -391,16 +391,16 @@ def main():
             blocks.append({"type":"section","text":{"type":"mrkdwn","text": line}})
         notify_slack("New future Lunchdrop dates available", blocks)
         print(f"📣 Notified Slack: {len(newly_available)} date(s)")
-else:
-    if SEND_HEARTBEAT:
-        blocks = [
-            {"type":"section","text":{"type":"mrkdwn","text":"*✅ Lunchdrop monitor ran — no new future menus to report.*"}},
-            {"type":"context","elements":[{"type":"mrkdwn","text":f"Window: {weekdays[0]} → {weekdays[-1]} (weekdays only)"}]}
-        ]
-        notify_slack("Lunchdrop monitor heartbeat — no new menus", blocks)
-        print("📣 Sent heartbeat to Slack.")
     else:
-        print("ℹ️ No new menus and heartbeat disabled — nothing sent to Slack.")
+        if SEND_HEARTBEAT:
+            blocks = [
+                {"type":"section","text":{"type":"mrkdwn","text":"*✅ Lunchdrop monitor ran — no new future menus to report.*"}},
+                {"type":"context","elements":[{"type":"mrkdwn","text":f"Window: {weekdays[0]} → {weekdays[-1]} (weekdays only)"}]}
+            ]
+            notify_slack("Lunchdrop monitor heartbeat — no new menus", blocks)
+            print("📣 Sent heartbeat to Slack.")
+        else:
+            print("ℹ️ No new menus and heartbeat disabled — nothing sent to Slack.")
 
     for e in errors:
         print(f"[warn] {e}")
