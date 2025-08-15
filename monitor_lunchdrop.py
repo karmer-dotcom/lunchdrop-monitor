@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Lunchdrop Future Menus Monitor — v7.4
+Lunchdrop Future Menus Monitor — v7.5
 - Parse Inertia payload (#app[data-page]) for reliable availability + names
 - Direct sign-in URL, persisted auth (storage_state) reused across dates
 - Skips weekends (Mon–Fri only)
-- SUMMARY_ONLY mode: Slack roll-up of current availability + names
+- SUMMARY_ONLY mode: Slack roll-up with one "click here to order" link at the top
 - Normal mode: diff detection + alerts; artifacts on auth failure or "no menus"
 """
 
@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 from datetime import date, timedelta
 
 # ----- Banner -----
-SCRIPT_VERSION = "v7.4"
+SCRIPT_VERSION = "v7.5"
 GITHUB_SHA = os.getenv("GITHUB_SHA", "")[:7]
 print(f"🚀 Lunchdrop monitor {SCRIPT_VERSION}  commit={GITHUB_SHA or 'local'}")
 
@@ -210,7 +210,6 @@ def detect_availability_and_deliveries(page) -> tuple[bool, list[dict], str]:
             if (d.get("isOpen") in (1, True)) and not d.get("isCancelled") and d.get("userCanOrder", True)
         ]
 
-        # Build name+url list
         info = []
         for d in open_deliveries:
             name = d.get("restaurantName") or (d.get("restaurant") or {}).get("name", "")
@@ -218,9 +217,7 @@ def detect_availability_and_deliveries(page) -> tuple[bool, list[dict], str]:
             if name:
                 info.append({"name": name, "url": url})
 
-        # Digest just from names to detect changes
         digest = content_hash(json.dumps(sorted([i["name"] for i in info]), sort_keys=True))
-
         return bool(open_deliveries), info, digest
     except Exception as e:
         print(f"⚠️ payload parse failed: {e}")
@@ -237,8 +234,9 @@ def check_date_with_auth(browser, d: date) -> dict:
         page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
         page.wait_for_timeout(1000)
 
-available, deliveries, digest = detect_availability_and_deliveries(page)
-names = [d["name"] for d in deliveries]
+        available, deliveries, digest = detect_availability_and_deliveries(page)
+        names = [r["name"] for r in deliveries]
+
         if available:
             print(f"🍽️  Found {len(names)} restaurant name(s): {', '.join(names)}")
         else:
@@ -252,8 +250,13 @@ names = [d["name"] for d in deliveries]
             except Exception as e:
                 print(f"⚠️ artifact save failed: {e}")
 
-        return {"url": url, "available": available, "digest": digest, "names": names, "deliveries": deliveries}
-
+        return {
+            "url": url,
+            "available": available,
+            "digest": digest,
+            "names": names,
+            "deliveries": deliveries
+        }
     except PlaywrightTimeoutError:
         return {"url": url, "error": f"Timeout loading {url}"}
     except Exception as e:
@@ -302,28 +305,35 @@ def main():
             for d in weekdays:
                 r = check_date_with_auth(browser, d)
                 if "error" in r:
-                    results.append((d, r["url"], False, [], r["error"]))
+                    results.append((d, r["url"], False, [], None, r["error"]))
                 else:
-                    results.append((d, r["url"], r["available"], r.get("names", []), None))
+                    results.append((d, r["url"], r["available"], r.get("names", []), r.get("deliveries", []), None))
             browser.close()
 
-            blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*🍱 Lunchdrop summary (weekdays)*"}}]
-           for d, url, avail, names, err in results:
-    if err:
-        line = f"*{d.isoformat()}* — <{url}|view> — ⚠️ error: `{err}`"
-    elif avail:
-        if deliveries:
-            parts = []
-            for r in deliveries:
-                if r["url"]:
-                    parts.append(f"{r['name']} (<{r['url']}|order>)")
+            # Build Slack blocks:
+            # Top line: single "click here to order" pointing at BASE_URL
+            blocks = [{
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*🍱 Lunchdrop (weekdays)* — <{BASE_URL}|click here to order>"
+                }
+            }]
+
+            for d, url, avail, names, deliveries, err in results:
+                dow = d.strftime("%a")           # Tue
+                pretty = d.strftime("%b %-d") if os.name != "nt" else d.strftime("%b %d")  # Aug 19
+                day_label = f"{dow}, {pretty}"
+                if err:
+                    line = f"*{day_label}* — ⚠️ error: `{err}`"
+                elif avail:
+                    if names:
+                        line = f"*{day_label}* — " + ", ".join(names)
+                    else:
+                        line = f"*{day_label}* — *(available, names not detected)*"
                 else:
-                    parts.append(r["name"])
-            line = f"*{d.isoformat()}* — <{url}|view> — " + ", ".join(parts)
-        else:
-            line = f"*{d.isoformat()}* — <{url}|view> — *(available, names not detected)*"
-    else:
-        line = f"*{d.isoformat()}* — <{url}|view> — _not available_"
+                    line = f"*{day_label}* — _not available_"
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": line}})
 
             notify_slack("Lunchdrop summary (weekdays)", blocks)
             print("📣 Posted summary to Slack. Exiting.")
@@ -338,7 +348,12 @@ def main():
                 errors.append(r["error"])
                 continue
 
-            snap_now = {"available": r["available"], "digest": r["digest"], "names": r.get("names", [])}
+            snap_now = {
+                "available": r["available"],
+                "digest": r["digest"],
+                "names": r.get("names", []),
+                "deliveries": r.get("deliveries", [])
+            }
             prev = load_state(url) or {}
             prev_available = prev.get("available")
             prev_digest = prev.get("digest")
@@ -348,32 +363,31 @@ def main():
             save_state(url, snap_now)
 
             became_available = (prev_available in (None, False)) and snap_now["available"]
+            changed = prev_digest and prev_digest != snap_now["digest"]
             names_added = sorted(now_names - prev_names)
 
-            if became_available:
-                newly_available.append((d, url, names_added or sorted(now_names)))
-                print(f"🎉 NEW: {d.isoformat()} became available; names={', '.join(names_added or now_names)}")
-            elif snap_now["available"] and prev_digest and prev_digest != snap_now["digest"]:
-                newly_available.append((d, url, names_added))
-                print(f"🔁 UPDATED: {d.isoformat()} content changed; +{len(names_added)} name(s)")
+            if became_available or (snap_now["available"] and changed):
+                newly_available.append((d, url, snap_now.get("names", [])))
+                print(f"🎉 ALERT: {d.isoformat()} — names={', '.join(snap_now.get('names', []))}")
 
         browser.close()
 
-    # ----- Slack -----
+    # ----- Slack (normal mode) -----
     if newly_available:
-        blocks = [{"type":"section","text":{"type":"mrkdwn","text":"*🎉 New future Lunchdrop dates available:*"}}]
-        for d, url, names_added in newly_available:
-    deliveries = snap_now.get("deliveries", [])
-    parts = []
-    for r in deliveries:
-        if r["url"]:
-            parts.append(f"{r['name']} (<{r['url']}|order>)")
-        else:
-            parts.append(r["name"])
-    line = f"• *{d.isoformat()}* — <{url}|view>"
-    if parts:
-        line += " — " + ", ".join(parts)
-    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": line}})
+        # Put a single "click here to order" at the top, then day lines
+        blocks = [{
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*🎉 New future Lunchdrop dates available* — <{BASE_URL}|click here to order>"
+            }
+        }]
+        for d, url, names in newly_available:
+            dow = d.strftime("%a")
+            pretty = d.strftime("%b %-d") if os.name != "nt" else d.strftime("%b %d")
+            day_label = f"{dow}, {pretty}"
+            line = f"• *{day_label}* — " + (", ".join(names) if names else "_available_")
+            blocks.append({"type":"section","text":{"type":"mrkdwn","text": line}})
         notify_slack("New future Lunchdrop dates available", blocks)
         print(f"📣 Notified Slack: {len(newly_available)} date(s)")
     else:
