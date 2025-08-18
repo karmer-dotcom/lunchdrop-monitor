@@ -4,17 +4,18 @@ Lunchdrop Future Menus Monitor — v7.6
 - Parse Inertia payload (#app[data-page]) for reliable availability + names
 - Direct sign-in URL, persisted auth (storage_state) reused across dates
 - Skips weekends (Mon–Fri only)
-- SUMMARY_ONLY mode: Slack roll-up with one "click here to order" link at the top
+- SUMMARY_ONLY mode: Slack roll-up (one "click here to order" link at the top)
 - Normal mode: diff detection + alerts; artifacts on auth failure or "no menus"
+- NEW: SEND_HEARTBEAT env flag to suppress the no-change heartbeat
 """
 
-import os, hashlib, json, time, re, string
+import os, hashlib, json, re, string
 from pathlib import Path
 from typing import Optional, Tuple
 from datetime import date, timedelta
 
 # ----- Banner -----
-SCRIPT_VERSION = "v7.5"
+SCRIPT_VERSION = "v7.6"
 GITHUB_SHA = os.getenv("GITHUB_SHA", "")[:7]
 print(f"🚀 Lunchdrop monitor {SCRIPT_VERSION}  commit={GITHUB_SHA or 'local'}")
 
@@ -365,7 +366,7 @@ def main():
 
             became_available = (prev_available in (None, False)) and snap_now["available"]
             changed = prev_digest and prev_digest != snap_now["digest"]
-            names_added = sorted(now_names - prev_names)
+            # names_added = sorted(now_names - prev_names)  # available if you want to show deltas later
 
             if became_available or (snap_now["available"] and changed):
                 newly_available.append((d, url, snap_now.get("names", [])))
@@ -374,7 +375,7 @@ def main():
         browser.close()
 
     # ----- Slack (normal mode) -----
-if newly_available:
+    if newly_available:
         # Put a single "click here to order" at the top, then day lines
         blocks = [{
             "type": "section",
