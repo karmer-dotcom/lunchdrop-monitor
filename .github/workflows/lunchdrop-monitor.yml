@@ -62,7 +62,7 @@ jobs:
           echo "SIGNIN_URL=${SIGNIN_URL}"
         env:
           BASE_URL: ${{ secrets.BASE_URL }}
-          SIGNIN_URL: ${{ vars.SIGNIN_URL }}
+          SIGNIN_URL: ${{ secrets.SIGNIN_URL }}
 
       - name: List restored state files
         run: |
@@ -74,7 +74,7 @@ jobs:
       - name: Run monitor
         env:
           BASE_URL: ${{ secrets.BASE_URL }}
-          SIGNIN_URL: ${{ vars.SIGNIN_URL }}
+          SIGNIN_URL: ${{ secrets.SIGNIN_URL }}
           LOOKAHEAD_DAYS: ${{ secrets.LOOKAHEAD_DAYS }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           LUNCHDROP_EMAIL: ${{ secrets.LUNCHDROP_EMAIL }}
