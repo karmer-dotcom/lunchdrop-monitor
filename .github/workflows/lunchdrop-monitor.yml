@@ -12,7 +12,6 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -37,38 +36,55 @@ jobs:
           python -m playwright install-deps
           python -m playwright install chromium
 
-      - name: Show commit and script head
-        run: |
-          echo "Commit from runner: $GITHUB_SHA"
-          echo "----- First 20 lines of monitor_lunchdrop.py -----"
-          sed -n '1,20p' monitor_lunchdrop.py
-      
-      - name: Cache state
+      # 🔧 Rolling caches for state & auth
+      - name: Restore state cache
+        id: state-cache
         uses: actions/cache@v4
         with:
           path: .ld_state
-          key: lunchdrop-state
+          key: lunchdrop-state-${{ github.run_id }}
+          restore-keys: |
+            lunchdrop-state-
 
-      - name: Cache auth state
+      - name: Restore auth cache
+        id: auth-cache
         uses: actions/cache@v4
         with:
           path: .auth
-          key: lunchdrop-auth
-          
+          key: lunchdrop-auth-${{ github.run_id }}
+          restore-keys: |
+            lunchdrop-auth-
+
+      - name: Show key env (safe)
+        run: |
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "BASE_URL=${BASE_URL}"
+          echo "SIGNIN_URL=${SIGNIN_URL}"
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          SIGNIN_URL: ${{ vars.SIGNIN_URL }}
+
+      - name: List restored state files
+        run: |
+          echo "== .ld_state contents =="
+          ls -la .ld_state || true
+          echo "== sample json =="
+          jq -c '.' .ld_state/*.json 2>/dev/null | head -n 3 || true
+
       - name: Run monitor
         env:
           BASE_URL: ${{ secrets.BASE_URL }}
+          SIGNIN_URL: ${{ vars.SIGNIN_URL }}
           LOOKAHEAD_DAYS: ${{ secrets.LOOKAHEAD_DAYS }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           LUNCHDROP_EMAIL: ${{ secrets.LUNCHDROP_EMAIL }}
           LUNCHDROP_PASSWORD: ${{ secrets.LUNCHDROP_PASSWORD }}
           HEADLESS: "true"
           VERBOSE: "true"
-          NO_MENU_MESSAGE: ${{ vars.NO_MENU_MESSAGE }}  # optional; omit to use default in code
-          SUMMARY_ONLY: "false"       # <— enables the summary mode
+          SUMMARY_ONLY: "false"
           SEND_HEARTBEAT: "true"
         run: python monitor_lunchdrop.py
-      
+
       - name: Upload artifacts (if any)
         if: always()
         uses: actions/upload-artifact@v4
@@ -76,3 +92,4 @@ jobs:
           name: lunchdrop-artifacts
           path: artifacts/*
           if-no-files-found: ignore
+
