@@ -2,12 +2,16 @@ name: Lunchdrop Monitor
 
 on:
   schedule:
-    # 9:30 AM CT
-    - cron: "30 14 * * 1-5"
-    # 12:00 PM CT
-    - cron: "0 17 * * 1-5"
-    # 4:00 PM CT
-    - cron: "0 21 * * 1-5"
+    # Weekdays (Mon–Fri) baseline: 9:30 AM, 12:00 PM, 4:00 PM CT
+    - cron: "30 14 * * 1-5"   # 9:30 AM CT
+    - cron: "0 17 * * 1-5"    # 12:00 PM CT
+    - cron: "0 21 * * 1-5"    # 4:00 PM CT
+
+    # Extra runs on Thu/Fri mornings (7, 8, 9, 10 AM CT)
+    - cron: "0 12 * * 4,5"    # 7:00 AM CT
+    - cron: "0 13 * * 4,5"    # 8:00 AM CT
+    - cron: "0 14 * * 4,5"    # 9:00 AM CT
+    - cron: "0 15 * * 4,5"    # 10:00 AM CT
   workflow_dispatch: {}
 jobs:
   run:
