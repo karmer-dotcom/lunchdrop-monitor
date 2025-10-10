@@ -36,7 +36,7 @@ LUNCHDROP_EMAIL = os.getenv("LUNCHDROP_EMAIL")
 LUNCHDROP_PASSWORD = os.getenv("LUNCHDROP_PASSWORD")
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "14"))
 SUMMARY_ONLY = os.getenv("SUMMARY_ONLY", "false").lower() == "true"
-SEND_HEARTBEAT = os.getenv("SEND_HEARTBEAT", "true").lower() == "true"
+SEND_HEARTBEAT = os.getenv("SEND_HEARTBEAT", "false").lower() == "true"
 
 # Sign-in URL: default guesses <root>/signin. Override via env if needed.
 def infer_signin_url(base: str) -> str:
