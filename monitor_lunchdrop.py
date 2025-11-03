@@ -125,6 +125,14 @@ SUBMIT_SELECTORS = [
     "input[type=submit]",
 ]
 
+# NEW: some sites split username and password across two steps
+CONTINUE_SELECTORS = [
+    "button:has-text('Continue')",
+    "button:has-text('Next')",
+    "[data-testid='continue']",
+    "[data-test='continue']",
+]
+
 def safe_has(page, sel: str) -> bool:
     try:
         return page.locator(sel).count() > 0
@@ -145,8 +153,8 @@ def try_click_any(page, selectors: list[str]) -> bool:
 # ----- Auth (persist + reuse) -----
 def ensure_logged_in_and_save_state(browser) -> None:
     """
-    Go directly to SIGNIN_URL, login if needed, then open BASE_URL to verify and
-    save storage_state to AUTH_STATE.
+    Go directly to SIGNIN_URL, handle username→continue→password flows if needed,
+    then open BASE_URL to verify and save storage_state to AUTH_STATE.
     """
     ctx = browser.new_context()
     page = ctx.new_page()
@@ -155,25 +163,72 @@ def ensure_logged_in_and_save_state(browser) -> None:
         page.goto(SIGNIN_URL, timeout=TIMEOUT_MS)
         page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
 
+        # Detect any sign-in UI
         if any(safe_has(page, s) for s in PASSWORD_SELECTORS + SIGNIN_SELECTORS):
             print("🧾 Login form detected; attempting login…")
+
+            # Step 1: username/email
+            filled_username = False
             for sel in SIGNIN_SELECTORS:
                 if safe_has(page, sel):
-                    page.fill(sel, LUNCHDROP_EMAIL); break
-            for sel in PASSWORD_SELECTORS:
-                if safe_has(page, sel):
-                    page.fill(sel, LUNCHDROP_PASSWORD); break
-            if not try_click_any(page, SUBMIT_SELECTORS):
-                page.keyboard.press("Enter")
-            page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-            page.wait_for_timeout(1500)
+                    page.fill(sel, LUNCHDROP_EMAIL)
+                    filled_username = True
+                    break
+
+            # If we filled a username, try to advance with Continue/Next/Enter.
+            if filled_username:
+                advanced = try_click_any(page, CONTINUE_SELECTORS)
+                if not advanced:
+                    # Some pages advance on submit/enter even in step 1
+                    advanced = try_click_any(page, SUBMIT_SELECTORS)
+                if not advanced:
+                    page.keyboard.press("Enter")
+
+                # Give the page a beat to swap in password UI
+                try:
+                    page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+                except Exception:
+                    pass
+                page.wait_for_timeout(800)  # small settle time
+
+            # Step 2: password (may already be present on same page)
+            password_present = any(safe_has(page, s) for s in PASSWORD_SELECTORS)
+            if not password_present:
+                # If it’s truly two-step, wait briefly for a password input to appear.
+                try:
+                    page.wait_for_selector(",".join(PASSWORD_SELECTORS), timeout=TIMEOUT_MS)
+                    password_present = True
+                except Exception:
+                    password_present = any(safe_has(page, s) for s in PASSWORD_SELECTORS)
+
+            if password_present:
+                for sel in PASSWORD_SELECTORS:
+                    if safe_has(page, sel):
+                        page.fill(sel, LUNCHDROP_PASSWORD)
+                        break
+
+                # Final submit
+                submitted = try_click_any(page, SUBMIT_SELECTORS)
+                if not submitted:
+                    # Some UIs reuse the Continue button for the final submit
+                    submitted = try_click_any(page, CONTINUE_SELECTORS)
+                if not submitted:
+                    page.keyboard.press("Enter")
+
+                try:
+                    page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+                except Exception:
+                    pass
+                page.wait_for_timeout(1500)
+
             print("✅ Login submitted.")
 
-        # Visit BASE_URL to ensure app view
+        # Visit BASE_URL to ensure app view & a valid session
         page.goto(BASE_URL, timeout=TIMEOUT_MS)
         page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
         page.wait_for_timeout(1000)
 
+        # If we still see auth fields, capture artifacts and fail
         still_login = any(safe_has(page, s) for s in PASSWORD_SELECTORS + SIGNIN_SELECTORS)
         if still_login:
             page.screenshot(path=str(ART_DIR / "auth-failed-screen.png"), full_page=True)
@@ -184,6 +239,7 @@ def ensure_logged_in_and_save_state(browser) -> None:
         print(f"🔒 Auth state saved to {AUTH_STATE}")
     finally:
         ctx.close()
+
 
 # ----- Payload-based detection -----
 def detect_availability_and_deliveries(page) -> tuple[bool, list[dict], str]:
