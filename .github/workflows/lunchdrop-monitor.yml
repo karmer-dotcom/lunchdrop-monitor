@@ -86,7 +86,7 @@ jobs:
           HEADLESS: "true"
           VERBOSE: "true"
           SUMMARY_ONLY: "false"
-          SEND_HEARTBEAT: "true"
+          SEND_HEARTBEAT: "false"
         run: python monitor_lunchdrop.py
 
       - name: Upload artifacts (if any)
